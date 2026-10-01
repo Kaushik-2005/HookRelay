@@ -1,0 +1,42 @@
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+
+# Go build artifacts
+bin/
+dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Go tooling caches when redirected into the repository
+.gocache/
+.gomodcache/
+.gopath/
+
+# Coverage and profiling output
+coverage.out
+coverage.html
+*.prof
+
+# Editor and operating-system files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Local logs and temporary files
+*.log
+tmp/
+temp/
+
+*.md
+!README.md
