@@ -7,6 +7,22 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: postgres://hookrelay:hookrelay@localhost:5432/hookrelay?sslmode=disable
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: hookrelay
+          POSTGRES_USER: hookrelay
+          POSTGRES_PASSWORD: hookrelay
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U hookrelay -d hookrelay"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -14,5 +30,7 @@ jobs:
           go-version: '1.23'
       - name: Test
         run: go test ./...
+      - name: Race test
+        run: go test -race ./...
       - name: Vet
         run: go vet ./...

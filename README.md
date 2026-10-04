@@ -161,12 +161,6 @@ The main workflow uses `POST /projects`, `POST /projects/{project_id}/webhooks`,
 See the [full API reference](docs/api.md) for all endpoints, pagination,
 replays, retries, delivery attempts, and management operations.
 
-## Full API reference
-
-The complete endpoint table is maintained in [docs/api.md](docs/api.md).
-
-<!-- The detailed endpoint table lives in docs/api.md. -->
-
 ## How it works
 
 The worker claims due deliveries with PostgreSQL row locks and a five-minute lease. A lease ID is checked when a result is recorded, so a worker whose claim expired cannot overwrite the result of a newer worker. The worker sends signed HTTP POST requests and records response codes, errors, attempt duration, and retry state.

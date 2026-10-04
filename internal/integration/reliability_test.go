@@ -250,7 +250,11 @@ func TestFailureScenarioMeasurements(t *testing.T) {
 			if item.statusCode != 0 && (responseCode == nil || *responseCode != item.statusCode) {
 				t.Fatalf("expected response code %d, got %v", item.statusCode, responseCode)
 			}
-			t.Logf("elapsed=%s response_code=%v attempts=%d retry_scheduled=true", elapsed.Round(time.Millisecond), responseCode, attempts)
+			loggedResponseCode := "none"
+			if responseCode != nil {
+				loggedResponseCode = strconv.Itoa(*responseCode)
+			}
+			t.Logf("elapsed=%s response_code=%s attempts=%d retry_scheduled=true", elapsed.Round(time.Millisecond), loggedResponseCode, attempts)
 		})
 	}
 }
