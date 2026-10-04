@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HookRelay Portal</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; }
+    body { max-width: 980px; margin: 0 auto; padding: 2rem; background: #111827; color: #e5e7eb; }
+    h1 { margin-bottom: .25rem; } section { background: #1f2937; padding: 1rem; margin: 1rem 0; border-radius: 10px; }
+    label { display: block; margin: .65rem 0 .2rem; color: #9ca3af; } input, button { padding: .6rem; border-radius: 6px; border: 1px solid #4b5563; }
+    input { width: min(100%, 520px); background: #111827; color: #fff; } button { cursor: pointer; background: #2563eb; color: white; margin: .5rem .5rem 0 0; }
+    pre { white-space: pre-wrap; background: #111827; padding: 1rem; border-radius: 6px; overflow: auto; } .muted { color: #9ca3af; }
+  </style>
+</head>
+<body>
+  <h1>HookRelay Portal</h1>
+  <p class="muted">Manage project webhooks and inspect delivery logs through the HookRelay API.</p>
+
+  <section>
+    <h2>Connection</h2>
+    <label for="base">API base URL</label>
+    <input id="base" value="">
+    <label for="key">Project API key</label>
+    <input id="key" type="password" placeholder="hr_live_...">
+    <label for="project">Project ID</label>
+    <input id="project" placeholder="project UUID">
+    <button onclick="loadWebhooks()">Load webhooks</button>
+  </section>
+
+  <section>
+    <h2>Register webhook</h2>
+    <label for="eventType">Event type</label>
+    <input id="eventType" value="payment.succeeded">
+    <label for="target">Target URL</label>
+    <input id="target" placeholder="https://example.com/webhooks">
+    <button onclick="createWebhook()">Register</button>
+    <button onclick="rotateSecret()">Rotate selected secret</button>
+  </section>
+
+  <section>
+    <h2>Webhooks</h2>
+    <pre id="webhooks">No data loaded.</pre>
+    <label for="webhook">Selected webhook ID</label>
+    <input id="webhook" placeholder="webhook UUID">
+    <button onclick="loadDeliveries()">Load deliveries</button>
+  </section>
+
+  <section>
+    <h2>Deliveries</h2>
+    <pre id="deliveries">No data loaded.</pre>
+  </section>
+
+  <script>
+    const byId = id => document.getElementById(id);
+    byId('base').value = window.location.origin;
+    const headers = () => ({'Authorization': `Bearer ${byId('key').value}`, 'Content-Type': 'application/json'});
+    const endpoint = path => `${byId('base').value.replace(/\/$/, '')}${path}`;
+    async function call(path, options = {}) {
+      const response = await fetch(endpoint(path), {...options, headers: {...headers(), ...(options.headers || {})}});
+      const text = await response.text();
+      let body; try { body = text ? JSON.parse(text) : null; } catch { body = text; }
+      if (!response.ok) throw new Error(`${response.status}: ${JSON.stringify(body)}`);
+      return body;
+    }
+    async function loadWebhooks() {
+      try { byId('webhooks').textContent = JSON.stringify(await call(`/projects/${byId('project').value}/webhooks`), null, 2); }
+      catch (error) { byId('webhooks').textContent = error.message; }
+    }
+    async function createWebhook() {
+      try {
+        const body = {event_type: byId('eventType').value, target_url: byId('target').value};
+        const result = await call(`/projects/${byId('project').value}/webhooks`, {method: 'POST', body: JSON.stringify(body)});
+        byId('webhook').value = result.id; byId('webhooks').textContent = JSON.stringify(result, null, 2);
+      } catch (error) { byId('webhooks').textContent = error.message; }
+    }
+    async function rotateSecret() {
+      try { byId('webhooks').textContent = JSON.stringify(await call(`/webhooks/${byId('webhook').value}/rotate-secret`, {method: 'POST'}), null, 2); }
+      catch (error) { byId('webhooks').textContent = error.message; }
+    }
+    async function loadDeliveries() {
+      try { byId('deliveries').textContent = JSON.stringify(await call(`/webhooks/${byId('webhook').value}/deliveries`), null, 2); }
+      catch (error) { byId('deliveries').textContent = error.message; }
+    }
+  </script>
+</body>
+</html>

@@ -11,9 +11,17 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"hookrelay/internal/limits"
+	"hookrelay/internal/observability"
+	"hookrelay/internal/pagination"
 )
 
-type Handler struct{ db *pgxpool.Pool }
+type Handler struct {
+	db          *pgxpool.Pool
+	rateLimiter *limits.ProjectRateLimiter
+	maxPending  int64
+	metrics     *observability.Metrics
+}
 
 type event struct {
 	ID        string          `json:"id"`
@@ -37,7 +45,9 @@ type errorBody struct {
 	Message string `json:"message"`
 }
 
-func NewHandler(db *pgxpool.Pool) *Handler { return &Handler{db: db} }
+func NewHandler(db *pgxpool.Pool, rateLimiter *limits.ProjectRateLimiter, maxPending int64, metrics *observability.Metrics) *Handler {
+	return &Handler{db: db, rateLimiter: rateLimiter, maxPending: maxPending, metrics: metrics}
+}
 
 func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	if h.db == nil {
@@ -51,6 +61,11 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	input.EventType = strings.TrimSpace(input.EventType)
+	if !h.rateLimiter.Allow(r.PathValue("project_id")) {
+		w.Header().Set("Retry-After", "1")
+		writeError(w, http.StatusTooManyRequests, "rate_limited", "project event rate limit exceeded")
+		return
+	}
 	idempotencyKey := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
 	if len(idempotencyKey) > 255 {
 		writeError(w, http.StatusBadRequest, "invalid_request", "Idempotency-Key must be 255 characters or fewer")
@@ -81,6 +96,17 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	if err := tx.QueryRow(r.Context(), `SELECT EXISTS (SELECT 1 FROM projects WHERE id = $1::uuid)`, r.PathValue("project_id")).Scan(&projectExists); err != nil || !projectExists {
 		writeError(w, http.StatusNotFound, "not_found", "project not found")
 		return
+	}
+	if h.maxPending > 0 {
+		var pending int64
+		if err := tx.QueryRow(r.Context(), `SELECT COUNT(*) FROM deliveries d JOIN events e ON e.id = d.event_id WHERE e.project_id = $1::uuid AND d.status IN ('pending', 'delivering')`, r.PathValue("project_id")).Scan(&pending); err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", "could not check delivery queue")
+			return
+		}
+		if pending >= h.maxPending {
+			writeError(w, http.StatusTooManyRequests, "queue_limit_exceeded", "project delivery queue is full")
+			return
+		}
 	}
 	if idempotencyKey != "" {
 		var existing event
@@ -114,10 +140,32 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	err = tx.QueryRow(r.Context(), `
 		INSERT INTO events (project_id, event_type, payload, idempotency_key, request_fingerprint)
 		VALUES ($1::uuid, $2, $3::jsonb, NULLIF($4, ''), NULLIF($5, ''))
+		ON CONFLICT (project_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
 		RETURNING id::text, project_id::text, event_type, payload, created_at::text`,
 		r.PathValue("project_id"), input.EventType, input.Payload, idempotencyKey, fingerprint).Scan(
 		&result.ID, &result.ProjectID, &result.EventType, &result.Payload, &result.CreatedAt,
 	)
+	if errors.Is(err, pgx.ErrNoRows) && idempotencyKey != "" {
+		var existingFingerprint string
+		err = tx.QueryRow(r.Context(), `
+			SELECT id::text, project_id::text, event_type, payload, created_at::text, request_fingerprint
+			FROM events WHERE project_id = $1::uuid AND idempotency_key = $2
+			FOR UPDATE`, r.PathValue("project_id"), idempotencyKey).Scan(
+			&result.ID, &result.ProjectID, &result.EventType, &result.Payload, &result.CreatedAt, &existingFingerprint,
+		)
+		if err == nil {
+			if existingFingerprint != fingerprint {
+				writeError(w, http.StatusConflict, "idempotency_conflict", "Idempotency-Key was already used with a different request")
+				return
+			}
+			if err = tx.Commit(r.Context()); err != nil {
+				writeError(w, http.StatusInternalServerError, "internal_error", "could not commit idempotent request")
+				return
+			}
+			writeJSON(w, http.StatusOK, result)
+			return
+		}
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "could not create event")
 		return
@@ -134,6 +182,9 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	if err = tx.Commit(r.Context()); err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "could not commit event")
 		return
+	}
+	if h.metrics != nil {
+		h.metrics.EventsPublished.Add(1)
 	}
 	writeJSON(w, http.StatusCreated, result)
 }
@@ -153,9 +204,25 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "project not found")
 		return
 	}
-	rows, err := h.db.Query(r.Context(), `
-		SELECT id::text, project_id::text, event_type, payload, created_at::text
-		FROM events WHERE project_id = $1::uuid ORDER BY created_at DESC`, r.PathValue("project_id"))
+	page, err := pagination.Parse(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	query := `SELECT id::text, project_id::text, event_type, payload, created_at::text FROM events WHERE project_id = $1::uuid`
+	args := []any{r.PathValue("project_id")}
+	if eventType := strings.TrimSpace(r.URL.Query().Get("event_type")); eventType != "" {
+		query += ` AND event_type = $2`
+		args = append(args, eventType)
+	}
+	if page.Cursor != nil {
+		query += fmt.Sprintf(` AND (created_at, id) < ($%d::timestamptz, $%d::uuid)`, len(args)+1, len(args)+2)
+		args = append(args, page.Cursor.CreatedAt, page.Cursor.ID)
+	}
+	query += ` ORDER BY created_at DESC`
+	args = append(args, page.Limit+1)
+	query += fmt.Sprintf(` LIMIT $%d`, len(args))
+	rows, err := h.db.Query(r.Context(), query, args...)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "could not list events")
 		return
@@ -174,7 +241,12 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal_error", "could not read events")
 		return
 	}
-	writeJSON(w, http.StatusOK, result)
+	next := ""
+	if len(result) > page.Limit {
+		last := result[page.Limit-1]
+		next = pagination.Encode(last.CreatedAt, last.ID)
+	}
+	writeJSON(w, http.StatusOK, pagination.Build(result, page.Limit, next))
 }
 
 func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {

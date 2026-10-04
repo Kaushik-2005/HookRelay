@@ -1,230 +1,391 @@
 # HookRelay
 
-HookRelay is a self-hosted webhook delivery service. Backends publish events to it, and HookRelay delivers signed webhooks, retries failures, and records delivery logs.
+[![CI](https://github.com/Kaushik-2005/HookRelay/actions/workflows/ci.yml/badge.svg)](https://github.com/Kaushik-2005/HookRelay/actions/workflows/ci.yml)
 
-The core flow is: create a project, register a webhook, publish an event, and inspect its delivery status. HookRelay keeps the event and delivery history in PostgreSQL while an in-process worker handles delivery asynchronously.
+HookRelay is a self-hosted webhook delivery service for backend applications.
+
+It accepts events, fans them out to matching subscriber endpoints, signs the exact request body with HMAC-SHA256, retries transient failures, and stores delivery history for debugging.
+
+## Features
+
+- Durable event publishing backed by PostgreSQL
+- At-least-once delivery with crash recovery
+- Automatic retries for transient failures
+- HMAC-SHA256 signed webhook requests
+- Delivery attempts, response codes, and retry history
+- SSRF protection for outbound webhook targets
+
+## Architecture
+
+    Backend application
+            |
+            | publish event
+            v
+    +--------------------+       +--------------------+
+    | HookRelay API      |------>| PostgreSQL         |
+    | projects/events    |       | source of truth    |
+    | webhooks/logs      |       | events + deliveries|
+    +--------------------+       +<-------------------+
+                                      ^
+                                      | claim pending rows,
+                                      | record attempts/results
+                                +-----+--------------+
+                                | Delivery worker   |
+                                | claim -> send     |
+                                | retry -> record   |
+                                +-----+--------------+
+                                      |
+                                      v
+                              Signed subscriber HTTP endpoints
+
+The API and worker both use PostgreSQL. The worker claims pending rows with
+database locks and leases; it does not receive deliveries directly from the
+API process. They can run together or as separate processes.
+
+## Contents
+
+- Features
+- Architecture
+- Quick start
+- Configuration
+- End-to-end demo
+- API essentials
+- Delivery behavior
+- Reliability guarantees
+- Security
+- Performance and testing
+- Documentation
+- Limitations
+- Development
+- Operations
 
 ## Quick start
 
-Requirements: Go 1.23+ and Docker Desktop.
+Requirements: Go 1.23 or newer and Docker Desktop.
 
 Start PostgreSQL:
 
-```powershell
-docker compose up -d postgres
-$env:DATABASE_URL = "postgres://hookrelay:hookrelay@localhost:5432/hookrelay?sslmode=disable"
-```
+    docker compose up -d postgres
 
-Start HookRelay in terminal 2:
+Set the database URL in the terminal that will run HookRelay:
 
-```powershell
-go mod download
-go run ./cmd/server
-```
+    $env:DATABASE_URL = "postgres://hookrelay:hookrelay@localhost:5432/hookrelay?sslmode=disable"
 
-The server listens on `:8080` by default. Check it with:
+Start the server:
 
-```powershell
-curl http://localhost:8080/health
-```
+    go mod download
+    go run ./cmd/server
 
-Configuration:
+Check health:
 
-- `PORT` — HTTP port, default `8080`
-- `DATABASE_URL` — PostgreSQL connection string; required for APIs and the worker
-- `DB_MAX_CONNS` — database pool size, default `5`
+    curl http://localhost:8080/health
+
+Expected response:
+
+    {"status":"ok","database":"connected"}
+
+Migrations run automatically at startup and are recorded in the schema_migrations table.
+
+Open the endpoint portal at http://localhost:8080/portal.
+
+## Configuration
+
+| Variable | Default | Purpose |
+|---|---:|---|
+| PORT | 8080 | HTTP port |
+| DATABASE_URL | empty | PostgreSQL connection string |
+| DB_MAX_CONNS | 5 | Database pool size |
+| HOOKRELAY_AUTH_REQUIRED | false | Require project API keys |
+| HOOKRELAY_BOOTSTRAP_KEY | empty | Bootstrap secret for initial project/API-key setup |
+| HOOKRELAY_RATE_LIMIT_PER_SECOND | 0 | Event publishes per project per second; zero disables the limit |
+| HOOKRELAY_MAX_PENDING_DELIVERIES | 10000 | Project queue limit; zero disables the limit |
+| HOOKRELAY_MAX_CONCURRENT_DELIVERIES | 10 | Worker concurrency per webhook |
+| HOOKRELAY_ALLOW_PRIVATE_NETWORKS | false | Allow local/private webhook targets; use only for local development |
+| HOOKRELAY_WORKER_ENABLED | true | Run the delivery worker in this process; set false for API-only mode |
+
+For production, enable authentication, use a long random bootstrap key, run behind TLS, and restrict access to the metrics endpoint.
+
+## Documentation
+
+- [API reference](docs/api.md)
+- [Authentication and bootstrap flow](docs/authentication.md)
+- [Benchmark methodology and published results](benchmarks/README.md)
+- [Continuous integration workflow](.github/workflows/ci.yml)
 
 ## End-to-end demo
 
-Demo flow:
+The demo uses development mode with authentication disabled. For an
+authenticated setup, enable auth and use the bootstrap key for project and
+initial API-key creation; use the resulting `$headers` API-key header for
+webhook, event, and delivery-management requests. See the
+[authentication guide](docs/authentication.md).
 
-1. Create a project with `POST /projects` and save its `id`.
-2. Register `http://localhost:9090/webhooks` for `payment.succeeded` and save the returned `secret`.
-3. Start the example receiver in another terminal with that secret:
+Use four terminals.
 
-   ```powershell
-   $env:HOOKRELAY_SECRET = "<secret returned when registering the webhook>"
-   go run ./examples/receiver
-   ```
+Terminal 1:
 
-4. Publish an event with `POST /projects/{project_id}/events`.
-5. Inspect `GET /events/{event_id}/deliveries` to see the delivered status.
-6. Stop the receiver, publish another event, and inspect its delivery log as retries are scheduled.
+    docker compose up -d postgres
 
-### Copy-paste PowerShell demo
+Terminal 2:
 
-Run these commands after PostgreSQL and HookRelay are running. The first two commands create the project and webhook and save their IDs in PowerShell variables:
+    $env:DATABASE_URL = "postgres://hookrelay:hookrelay@localhost:5432/hookrelay?sslmode=disable"
+    $env:HOOKRELAY_ALLOW_PRIVATE_NETWORKS = "true"
+    go run ./cmd/server
 
-```powershell
-$project = Invoke-RestMethod -Method Post `
-  -Uri "http://localhost:8080/projects" `
-  -ContentType "application/json" `
-  -Body '{"name":"Demo Payment App"}'
+Terminal 3, create a project and webhook:
 
-$webhook = Invoke-RestMethod -Method Post `
-  -Uri "http://localhost:8080/projects/$($project.id)/webhooks" `
-  -ContentType "application/json" `
-  -Body '{"event_type":"payment.succeeded","target_url":"http://localhost:9090/webhooks"}'
+    $project = Invoke-RestMethod -Method Post -Uri "http://localhost:8080/projects" -ContentType "application/json" -Body '{"name":"Demo Payment App"}'
+    $webhook = Invoke-RestMethod -Method Post -Uri "http://localhost:8080/projects/$($project.id)/webhooks" -ContentType "application/json" -Body '{"event_type":"payment.succeeded","target_url":"http://localhost:9090/webhooks"}'
+    $project.id
+    $webhook.id
+    $webhook.secret
 
-$project.id
-$webhook.id
-$webhook.secret
-```
+Terminal 4, signed receiver:
 
-Copy the printed secret into terminal 3 and start the receiver:
+    $env:HOOKRELAY_SECRET = "paste-the-webhook-secret-here"
+    go run ./examples/receiver
 
-```powershell
-$env:HOOKRELAY_SECRET = "paste-the-secret-here"
-go run ./examples/receiver
-```
+Back in terminal 3, publish and inspect:
 
-Return to the HookRelay terminal and publish an event:
+    $event = Invoke-RestMethod -Method Post -Uri "http://localhost:8080/projects/$($project.id)/events" -ContentType "application/json" -Body '{"event_type":"payment.succeeded","payload":{"payment_id":"pay_123","amount":999,"currency":"INR"}}'
+    Invoke-RestMethod -Uri "http://localhost:8080/events/$($event.id)/deliveries" | ConvertTo-Json -Depth 5
 
-```powershell
-$event = Invoke-RestMethod -Method Post `
-  -Uri "http://localhost:8080/projects/$($project.id)/events" `
-  -ContentType "application/json" `
-  -Body '{"event_type":"payment.succeeded","payload":{"payment_id":"pay_123","amount":999,"currency":"INR"}}'
+A successful delivery has status delivered, attempt_count 1, and response_code 200.
 
-$event.id
-```
+## API essentials
 
-Wait a few seconds for the worker, then inspect the delivery:
+The main workflow uses `POST /projects`, `POST /projects/{project_id}/webhooks`,
+`POST /projects/{project_id}/events`, and
+`GET /events/{event_id}/deliveries`.
 
-```powershell
-Invoke-RestMethod -Uri "http://localhost:8080/events/$($event.id)/deliveries" |
-  ConvertTo-Json -Depth 5
-```
+See the [full API reference](docs/api.md) for all endpoints, pagination,
+replays, retries, delivery attempts, and management operations.
 
-Expected result includes `"status": "delivered"`, `"attempt_count": 1`, and `"response_code": 200`. The receiver terminal logs the verified event body.
+## Full API reference
 
-To observe a failure, stop the receiver, publish another event, and inspect its delivery record. Retryable failures receive a future `next_retry_at`. A failed delivery can be manually requeued with:
+The complete endpoint table is maintained in [docs/api.md](docs/api.md).
 
-```powershell
-Invoke-RestMethod -Method Post `
-  -Uri "http://localhost:8080/deliveries/{delivery_id}/retry" |
-  ConvertTo-Json -Depth 5
-```
+<!-- The detailed endpoint table lives in docs/api.md. -->
 
-When `DATABASE_URL` is set, startup applies pending SQL files from `migrations/` and records them in `schema_migrations`.
+## How it works
 
-## Projects
+The worker claims due deliveries with PostgreSQL row locks and a five-minute lease. A lease ID is checked when a result is recorded, so a worker whose claim expired cannot overwrite the result of a newer worker. The worker sends signed HTTP POST requests and records response codes, errors, attempt duration, and retry state.
 
-Create a project:
+Delivery lifecycle:
 
-```powershell
-curl -X POST http://localhost:8080/projects `
-  -H "Content-Type: application/json" `
-  -d '{"name":"Demo Payment App"}'
-```
+    event accepted
+        -> pending delivery rows created in the same transaction
+        -> worker claims a row with an expiring lease
+        -> delivering
+        -> delivered
+           or failed -> retry due -> delivering
 
-List projects with `GET /projects`, or fetch one with `GET /projects/{project_id}`.
+HookRelay provides at-least-once delivery. If a process or network fails after the receiver accepts a request but before HookRelay records success, the request can be sent again. Receivers should deduplicate by X-HookRelay-Event-ID. PostgreSQL preserves events and delivery history; a crashed worker's lease is reclaimed after it expires. Graceful shutdown stops new HTTP work and lets in-flight API requests finish within the shutdown timeout.
 
-Register a webhook:
+Retryable failures are network errors, timeouts, HTTP 408, 409, 429, and 5xx responses. Other 4xx responses fail immediately. Manual retry and event replay preserve previous delivery history.
 
-```powershell
-curl -X POST http://localhost:8080/projects/{project_id}/webhooks `
-  -H "Content-Type: application/json" `
-  -d '{"event_type":"payment.succeeded","target_url":"https://example.com/webhooks/payments"}'
-```
+Retry schedule:
 
-The response includes the generated signing secret. Webhooks can be listed, updated with `PATCH /webhooks/{webhook_id}`, or disabled with `DELETE /webhooks/{webhook_id}`.
+| Attempt | Timing |
+|---|---|
+| 1 | Immediate |
+| 2 | After 1 minute |
+| 3 | After 5 minutes |
+| 4 | After 15 minutes |
+| 5 | Final attempt, after 15 minutes; if it fails, permanent failure |
 
-Publish an event:
+Attempt five is sent and can succeed. Permanent failure is recorded only when
+that fifth attempt also fails; HookRelay does not schedule a sixth attempt.
+Each delay is measured from the preceding failed attempt, not from the
+original event creation time.
 
-```powershell
-curl -X POST http://localhost:8080/projects/{project_id}/events `
-  -H "Content-Type: application/json" `
-  -d '{"event_type":"payment.succeeded","payload":{"payment_id":"pay_123","amount":999,"currency":"INR"}}'
-```
+## Reliability guarantees
 
-Publishing stores the event and creates a pending delivery for every active webhook in the project matching the event type. Events can be listed with `GET /projects/{project_id}/events` or fetched with `GET /events/{event_id}`.
+Events and their initial delivery rows are committed in one PostgreSQL
+transaction. A successful event response therefore means the event is stored
+with its matching delivery work, not merely accepted in memory.
 
-When PostgreSQL is configured, an in-process worker polls pending deliveries, sends signed HTTP POST requests, and records response codes or failure details. The worker uses row locking so multiple HookRelay processes do not claim the same delivery.
+Event publishing supports `Idempotency-Key`:
 
-Retryable failures are network errors, timeouts, `409`, `429`, and `5xx` responses. They are retried with delays of 1 minute, 5 minutes, and 15 minutes, up to five attempts. Other `4xx` responses fail immediately.
+- Repeating the same key and request returns the original event.
+- Reusing a key with a different event type or payload returns `409 Conflict`.
+- Concurrent requests using the same key are resolved through the PostgreSQL
+  unique index rather than creating duplicate events.
 
-Inspect delivery logs with `GET /events/{event_id}/deliveries`, `GET /webhooks/{webhook_id}/deliveries`, or `GET /deliveries/{delivery_id}`.
+Worker recovery behavior:
 
-Manually retry a failed delivery with `POST /deliveries/{delivery_id}/retry`. Delivered deliveries cannot be retried.
+- Claims use `FOR UPDATE SKIP LOCKED` and a five-minute lease.
+- A worker crash leaves the delivery in `delivering`; another worker can
+  reclaim it after the lease expires.
+- Completion requires the current lease ID, preventing an old worker from
+  overwriting a newer attempt.
+- A request may be delivered more than once if the receiver accepts it before
+  HookRelay records the result. Consumers must be idempotent.
+- Delivery attempts, response codes, errors, durations, and retry state remain
+  queryable after recovery.
 
-## API reference
+The server handles SIGINT and SIGTERM, stops claiming new deliveries, and
+allows already-claimed deliveries to finish within the bounded outbound
+request context. Outbound webhook requests have a 10-second HTTP client
+timeout; if it expires, the attempt is recorded as a network failure, the
+delivery becomes failed, and a retry is scheduled when attempts remain. HTTP
+graceful shutdown has a 15-second deadline and waits for the worker before
+closing the database pool. HTTP read, write, idle, and header timeouts are
+also configured to avoid indefinitely held connections.
 
-| Method | Endpoint | Purpose |
-|---|---|---|
-| `GET` | `/health` | Check server and database status |
-| `POST` | `/projects` | Create a project |
-| `GET` | `/projects` | List projects |
-| `GET` | `/projects/{project_id}` | Get a project |
-| `POST` | `/projects/{project_id}/webhooks` | Register a webhook |
-| `GET` | `/projects/{project_id}/webhooks` | List project webhooks |
-| `PATCH` | `/webhooks/{webhook_id}` | Update a webhook |
-| `DELETE` | `/webhooks/{webhook_id}` | Disable a webhook |
-| `POST` | `/projects/{project_id}/events` | Publish an event |
-| `GET` | `/projects/{project_id}/events` | List project events |
-| `GET` | `/events/{event_id}` | Get an event |
-| `GET` | `/events/{event_id}/deliveries` | List deliveries for an event |
-| `GET` | `/webhooks/{webhook_id}/deliveries` | List deliveries for a webhook |
-| `GET` | `/deliveries/{delivery_id}` | Get one delivery |
-| `POST` | `/deliveries/{delivery_id}/retry` | Retry a failed delivery |
+## Security
 
-API errors use this shape:
+Every webhook request includes:
 
-```json
-{
-  "error": {
-    "code": "invalid_request",
-    "message": "target_url is required"
-  }
-}
-```
+    X-HookRelay-Event-ID
+    X-HookRelay-Delivery-ID
+    X-HookRelay-Timestamp
+    X-HookRelay-Signature: sha256=<hex HMAC>
 
-## Signature verification
+The signing input is:
 
-Every delivery includes:
+    timestamp + "." + raw_body
 
-```text
-X-HookRelay-Event-ID
-X-HookRelay-Timestamp
-X-HookRelay-Signature: sha256=<hex HMAC>
-```
+Receivers must verify the raw body before JSON unmarshaling and should reject old timestamps to reduce replay risk. Webhook secrets are returned during creation or rotation and should be stored securely.
 
-The signature is HMAC-SHA256 over the exact raw request body:
+Webhook requests do not follow redirects. DNS names are resolved again at connection time, and resolved loopback, private, link-local, multicast, unspecified, and reserved addresses are blocked by default to reduce SSRF and DNS-rebinding risk. Local receivers such as `localhost:9090` require `HOOKRELAY_ALLOW_PRIVATE_NETWORKS=true`; do not enable that setting for an internet-facing deployment. Custom headers cannot replace the Host, Content-Length, connection, or HookRelay signature headers.
 
-```text
-timestamp + "." + raw_body
-```
+Deduplication guidance:
 
-Example verification in Go:
+- `X-HookRelay-Event-ID` identifies the logical event. Every subscriber
+  delivery for that event and every retry of the same delivery uses the same
+  event ID.
+- `X-HookRelay-Delivery-ID` identifies one delivery record for one webhook.
+  Retries reuse that delivery ID, while a manual replay creates a new
+  delivery ID for the same event.
+- Deduplicate by event ID when an event should be processed once globally.
+  Deduplicate by delivery ID when each subscriber delivery should be handled
+  once while still allowing a manual replay to be processed.
 
-```go
-func verifySignature(secret string, timestamp string, body []byte, header string) bool {
-    mac := hmac.New(sha256.New, []byte(secret))
-    mac.Write([]byte(timestamp + "."))
-    mac.Write(body)
-    expected := "sha256=" + hex.EncodeToString(mac.Sum(nil))
-    return hmac.Equal([]byte(expected), []byte(header))
-}
-```
+Therefore, `X-HookRelay-Event-ID` alone is not sufficient to distinguish
+fan-out deliveries or a manual replay. Receivers should choose the key that
+matches their processing semantics and still make handlers idempotent.
 
-Receivers should read and verify the raw body before unmarshaling JSON, and should reject timestamps outside their acceptable replay window.
+API errors use:
 
-## Idempotent event publishing
+    {
+      "error": {
+        "code": "invalid_request",
+        "message": "target_url is required"
+      }
+    }
 
-Send an optional `Idempotency-Key` header when publishing an event. Repeating the same key with the same event type and payload returns the original event without creating duplicate deliveries. Reusing the key with different request data returns `409 Conflict`.
+## Observability
 
-## Tests
+GET /metrics exposes event, delivery, failure, retry, duration, and queue-depth metrics. Request logs are emitted as JSON with method, path, status, and duration.
 
-Run the automated checks with:
+## Performance and testing
 
-```powershell
-go test ./...
-```
+Run the reproducible standard-library benchmark runner:
 
-The test suite covers URL validation, secret generation, idempotency fingerprints, HMAC signatures, and retry rules.
+    go run ./cmd/bench -url http://localhost:8080/health -requests 5000 -concurrency 50
 
-## Architecture summary
+It reports throughput, errors, status counts, and p50/p95/p99 latency. Use a controlled receiver plus the delivery and attempt endpoints for slow, 429, 500, unavailable-endpoint, and worker-restart scenarios. See `benchmarks/README.md` for the measurement protocol. Results are environment-dependent, so record the command and runtime versions with each run.
 
-HookRelay is a self-hosted Go webhook delivery service for backend applications. It stores projects, subscriber webhooks, events, and delivery records in PostgreSQL. Event publishing fans out pending deliveries transactionally; an in-process worker claims them safely, signs the exact payload bytes with HMAC-SHA256, delivers them over HTTP, retries transient failures with backoff, and exposes delivery logs for debugging.
+With PostgreSQL running, execute the database-backed reliability tests and
+delivery benchmark:
 
-Resume bullet: Built HookRelay, a self-hosted webhook delivery service in Go that lets backend applications publish events, deliver signed webhook payloads to subscriber endpoints, retry failed deliveries with backoff, and inspect delivery logs for debugging.
+    $env:DATABASE_URL = "postgres://hookrelay:hookrelay@localhost:5432/hookrelay?sslmode=disable"
+    go test ./internal/integration -v -count=1
+    $env:HOOKRELAY_BENCH_WORKER_CONCURRENCY = "1"
+    go test ./internal/integration -run '^$' -bench BenchmarkEventPublishAndDelivery -benchtime=100x -count=1
+
+Repeat the benchmark at worker concurrency `2`, `5`, and `10`. See
+[benchmarks/README.md](benchmarks/README.md) for the exact test matrix,
+published results, queue-wait analysis, and failure scenarios.
+
+### Published performance summary
+
+The latest PostgreSQL-backed run achieved 78.63-87.22 deliveries/second at
+worker concurrency 1-10. End-to-end p50 latency was 582-647 ms, but the
+recorded HTTP p50 was 2 ms; most latency was queue/database waiting. Detailed
+tables, methodology, and failure-scenario results are in
+[benchmarks/README.md](benchmarks/README.md). These are local development
+measurements, not production capacity guarantees.
+
+### Current benchmark result
+
+Smoke result on October 4, 2026, Windows, Go local server without PostgreSQL:
+`1000` health requests at concurrency `25` completed with `0` errors in
+`175 ms` (`5700.09 req/s`); p50 `3.514 ms`, p95 `5.997 ms`, p99 `26.112 ms`,
+all responses HTTP 200.
+
+Important limitation: these results measure HTTP health-check performance, not
+webhook delivery performance. They should not be presented as HookRelay event
+publishing or delivery throughput. Actual delivery benchmarks must include
+event creation, PostgreSQL writes, delivery claims, signed outbound requests,
+retries, slow receivers, HTTP 429/500 responses, unavailable endpoints, and
+worker recovery.
+
+## Limitations
+
+- Delivery is at least once, not exactly once. A receiver may receive a
+  request again if HookRelay loses the result after the receiver accepted it.
+- Receivers are responsible for idempotent processing and should choose event
+  ID or delivery ID deduplication according to their semantics.
+- Local benchmark results depend on hardware, PostgreSQL, network conditions,
+  and receiver behavior. They are not production capacity guarantees.
+- The default worker polls PostgreSQL every five seconds. Event publishing is
+  durable immediately, while delivery pickup latency depends on polling and
+  current queue load.
+
+## Production deployment checklist
+
+Use this as a deployment review checklist; it is not a claim that every
+operational control is provided by the application:
+
+- [ ] Enable API authentication and configure a strong bootstrap secret
+- [ ] Deploy behind HTTPS
+- [ ] Keep private-network webhook targets disabled
+- [ ] Restrict access to `/metrics` and `/portal`
+- [ ] Configure PostgreSQL backups and connection limits
+- [ ] Define monitoring and alerts for failed deliveries and queue depth
+- [ ] Test recovery and graceful shutdown in the deployment environment
+
+## Operations
+
+If health reports database not configured, set DATABASE_URL before starting the server.
+
+If port 8080 is occupied, find the listener:
+
+    Get-NetTCPConnection -LocalPort 8080 -State Listen
+
+Or use another port:
+
+    $env:PORT = "8081"
+    go run ./cmd/server
+
+If a webhook remains pending, check the worker log, receiver process, delivery record, and delivery-attempt endpoint.
+
+## Development
+
+Run tests and static checks:
+
+    go test ./...
+    go vet ./...
+
+The test suite includes webhook URL validation, redirect blocking, private-IP
+blocking, HMAC signing, retry classification, retry timing, and idempotency
+fingerprint checks. Database-backed recovery scenarios should be run with the
+Docker PostgreSQL service and the benchmark matrix above.
+
+Worker shutdown behavior is also covered by the implementation: shutdown stops
+new claims, lets already-claimed deliveries finish within the bounded delivery
+context, waits for the worker, and only then closes the database pool.
+
+GitHub Actions runs `go test ./...` and `go vet ./...` on pushes and pull
+requests. PostgreSQL integration tests require a database URL and are run
+explicitly with the command in the Benchmarks section.
+
+PostgreSQL is the source of truth. The API and worker share internal packages,
+and can run together with the default configuration or as separate processes:
+
+    $env:HOOKRELAY_WORKER_ENABLED = "false"
+    go run ./cmd/server
+
+    go run ./cmd/worker

@@ -3,11 +3,14 @@ package projects
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"hookrelay/internal/auth"
+	"hookrelay/internal/pagination"
 )
 
 type Handler struct{ db *pgxpool.Pool }
@@ -70,9 +73,29 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rows, err := h.db.Query(r.Context(), `
-		SELECT id::text, name, created_at::text, updated_at::text
-		FROM projects ORDER BY created_at DESC`)
+	page, err := pagination.Parse(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	query := `SELECT id::text, name, created_at::text, updated_at::text FROM projects`
+	args := []any{}
+	conditions := []string{}
+	if projectID, ok := auth.ProjectID(r.Context()); ok {
+		conditions = append(conditions, `id = $1::uuid`)
+		args = append(args, projectID)
+	}
+	if page.Cursor != nil {
+		conditions = append(conditions, fmt.Sprintf(`(created_at, id) < ($%d::timestamptz, $%d::uuid)`, len(args)+1, len(args)+2))
+		args = append(args, page.Cursor.CreatedAt, page.Cursor.ID)
+	}
+	if len(conditions) > 0 {
+		query += ` WHERE ` + strings.Join(conditions, ` AND `)
+	}
+	query += ` ORDER BY created_at DESC`
+	args = append(args, page.Limit+1)
+	query += fmt.Sprintf(` LIMIT $%d`, len(args))
+	rows, err := h.db.Query(r.Context(), query, args...)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "could not list projects")
 		return
@@ -92,7 +115,12 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal_error", "could not read projects")
 		return
 	}
-	writeJSON(w, http.StatusOK, projects)
+	next := ""
+	if len(projects) > page.Limit {
+		last := projects[page.Limit-1]
+		next = pagination.Encode(last.CreatedAt, last.ID)
+	}
+	writeJSON(w, http.StatusOK, pagination.Build(projects, page.Limit, next))
 }
 
 func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
